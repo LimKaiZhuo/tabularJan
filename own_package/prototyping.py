@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import optuna
+import lightgbm as lgb
 import xgboost as xgb
 import scipy as sp
 import scipy.stats
@@ -122,6 +123,7 @@ def lvl1_randomsearch(rawdf, testdf, results_dir, pp_choice, lt_choice=None, n_i
 
 def xgb_optuna(train_dir, test_dir, results_dir):
     meta_params = results_dir.split('_')
+    est_type = meta_params[-6].rpartition('/')[-1]
     n_iter = int(meta_params[-4][1:])
     pp_choice = int(meta_params[-3][2:])
     lt_choice = int(meta_params[-2][2:])
@@ -140,26 +142,56 @@ def xgb_optuna(train_dir, test_dir, results_dir):
         pp.fit(x_train)
         x_train = pp.transform(x_train)
         x_val = pp.transform(x_val)
-        params = {  # 'tree_method': 'gpu_hist',
-            'random_state': np.random.RandomState(seed),
-            'verbose': 0,
-            'n_estimators': 3000,
-            'learning_rate': trial.suggest_uniform('learning_rate', 0.005, 0.5),
-            'subsample': trial.suggest_uniform('subsample', 0.5, 1),
-            'max_depth': trial.suggest_int('max_depth', 1, 15),
-            'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.5, 1),
-            'gamma': trial.suggest_loguniform('gamma', 1e-6, 5),
-        }
-        regr = XGBRegressor(**params)
-        regr.fit(x_train, y_train,
-                 eval_metric='rmse',
-                 eval_set=[(pp.transform(x_val2), y_val2)],
-                 early_stopping_rounds=10)
-        y_val_pred = regr.predict(x_val)
+        if est_type == 'xgb':
+            params = {  # 'tree_method': 'gpu_hist',
+                'verbose': 0,
+                'n_estimators': 3000,
+                'learning_rate': trial.suggest_uniform('learning_rate', 0.005, 0.5),
+                'subsample': trial.suggest_uniform('subsample', 0.5, 1),
+                'max_depth': trial.suggest_int('max_depth', 1, 15),
+                'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.5, 1),
+                'gamma': trial.suggest_loguniform('gamma', 1e-6, 5),
+            }
+            regr = XGBRegressor(**params)
+            regr.fit(x_train, y_train,
+                     eval_metric='rmse',
+                     eval_set=[(pp.transform(x_val2), y_val2)],
+                     early_stopping_rounds=10)
+            y_val_pred = regr.predict(x_val)
+        elif est_type == 'lightgbm':
+            # objective_list_reg = ['huber', 'gamma', 'fair', 'tweedie']
+            params = {
+                'num_leaves': trial.suggest_int('num_leaves', 2, 2 ** 11),
+                'max_depth': trial.suggest_int('max_depth', 2, 25),
+                'max_bin': trial.suggest_int('max_bin', 32, 550),
+                'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 1, 256),
+                'min_data_in_bin': trial.suggest_int('min_data_in_bin', 1, 256),
+                'min_gain_to_split': trial.suggest_discrete_uniform('min_gain_to_split', 0.1, 5, 0.01),
+                'lambda_l1': trial.suggest_loguniform('lambda_l1', 1e-8, 10),
+                'lambda_l2': trial.suggest_loguniform('lambda_l2', 1e-8, 10),
+                'learning_rate': trial.suggest_loguniform('learning_rate', 0.001, 0.1),
+                'bagging_fraction': trial.suggest_discrete_uniform('bagging_fraction', 0.4, 1, 0.01),
+                'feature_fraction': trial.suggest_discrete_uniform('feature_fraction', 0.4, 1, 0.01),
+                'boosting': 'gbdt',
+                'metric': 'rmse',
+                'objective': 'rmse',
+                'verbose': -1
+            }
+            earlyStop = 500
+            numRounds = 5000
+            verboseEval = 100
+            dTrain = lgb.Dataset(x_train, label=y_train)
+            dValid = lgb.Dataset(pp.transform(x_val2), label=y_val2)
+            watchlist = [dValid]
+            regr = lgb.train(params, train_set=dTrain, num_boost_round=numRounds, valid_sets=watchlist,
+                             verbose_eval=verboseEval, early_stopping_rounds=earlyStop)
+            y_val_pred = regr.predict(x_val, num_iteration=regr.best_iteration)
+        else:
+            raise KeyError(f'est {est_type} is not a valid choice.')
         return np.sqrt(mean_squared_error(y_val, y_val_pred))
 
-    study = optuna.create_study(study_name='xgb_optuna', direction='minimize')
-    study.optimize(objective, n_trials=n_iter)
+    study = optuna.create_study(study_name=f'{est_type}_optuna', direction='minimize')
+    study.optimize(objective, n_trials=n_iter, show_progress_bar=True)
     results_dir = create_results_directory(results_dir)
     with open(f'{results_dir}/results_store.pkl', 'wb') as f:
         pickle.dump(study, f)
@@ -169,6 +201,7 @@ def xgb_optuna(train_dir, test_dir, results_dir):
 
 def xgb_optuna_predict(best_params, train_dir, test_dir, results_dir):
     meta_params = results_dir.split('_')
+    est_type = meta_params[-6].rpartition('/')[-1]
     n_iter = int(meta_params[-4][1:])
     pp_choice = int(meta_params[-3][2:])
     lt_choice = int(meta_params[-2][2:])
@@ -183,19 +216,37 @@ def xgb_optuna_predict(best_params, train_dir, test_dir, results_dir):
     x_train, x_val2, y_train, y_val2 = train_test_split(x_main, y_main, test_size=0.1, random_state=seed)
     pp.fit(x_train)
     x_train = pp.transform(x_train)
-    params = {'random_state': np.random.RandomState(seed),
-              'verbose': 0,
-              'n_estimators': 3000,
-              **best_params}
-    regr = XGBRegressor(**params)
-    regr.fit(x_train, y_train,
-             eval_metric='rmse',
-             eval_set=[(x_train, y_train), (pp.transform(x_val2), y_val2)],
-             early_stopping_rounds=10)
+    if est_type == 'xgb':
+        params = {'verbose': 0,
+                  'n_estimators': 3000,
+                  **best_params}
+        regr = XGBRegressor(**params)
+        regr.fit(x_train, y_train,
+                 eval_metric='rmse',
+                 eval_set=[(x_train, y_train), (pp.transform(x_val2), y_val2)],
+                 early_stopping_rounds=10)
+    elif est_type == 'lightgbm':
+        params = {'boosting': 'gbdt',
+                  'metric': 'rmse',
+                  'objective': 'rmse',
+                  'verbose': -1, **best_params
+                  }
+        earlyStop = 500
+        numRounds = 5000
+        verboseEval = 100
+        dTrain = lgb.Dataset(x_train, label=y_train)
+        dValid = lgb.Dataset(pp.transform(x_val2), label=y_val2)
+        watchlist = [dValid]
+        regr = lgb.train(params, train_set=dTrain, num_boost_round=numRounds, valid_sets=watchlist,
+                         verbose_eval=verboseEval, early_stopping_rounds=earlyStop)
 
     del train_df
     x_test = pd.read_csv(test_dir)
-    y_test_pred = regr.predict(pp.transform(x_test))
+    if est_type == 'xgb':
+        y_test_pred = regr.predict(pp.transform(x_test))
+    elif est_type == 'lightgbm':
+        y_test_pred = regr.predict(pp.transform(x_test), num_iteration=regr.best_iteration)
+
     sub = pd.DataFrame()
     sub['id'] = x_test['id']
     sub['target'] = y_test_pred

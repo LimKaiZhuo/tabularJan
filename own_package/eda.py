@@ -11,11 +11,18 @@ def eda_1():
     results_dir = create_results_directory('./results/eda/eda_1')
     plot_barh(train.isnull().sum(), title='null%', total_count=train.shape[0], plot_dir=f'{results_dir}/null_percent.png')
 
+    train['target'].plot.kde()
+    plt.savefig(f'{results_dir}/target_kde.png', bbox_inches='tight')
+    plt.close()
+
     train = pd.melt(train, id_vars='id', value_name='value', var_name='name')
     g = sns.FacetGrid(train, col='name', col_wrap=5, sharex=False)
     g.map(sns.kdeplot, 'value')
     plt.savefig(f'{results_dir}/kde.png', bbox_inches='tight')
     plt.close()
+
+    test = pd.read_csv('./inputs/test.csv')
+
 
 
 
